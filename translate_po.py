@@ -138,50 +138,85 @@ def find_untranslated_entries(po_dir):
 
     return results
 
-def translate_text_deepl(text, target_lang, api_url, endpoint_type="free", max_retries=3):
+def translate_text_deepl(text, target_lang, api_url, endpoint_type="free", max_retries=3, request_delay=1.0):
     """Translate text using DeepL API with retry logic
 
     Args:
-        text: Text to translate
+        text: Text to translate (string or list of strings for batch)
         target_lang: Target language code (e.g., 'ZH', 'DE')
         api_url: API endpoint URL
         endpoint_type: Type of endpoint - 'free', 'pro', or 'official'
         max_retries: Maximum number of retry attempts
+        request_delay: Delay between individual requests in free endpoint batch mode
+
+    Returns:
+        Translated text (string) or list of translated texts for batch
     """
+    # Check if batch translation
+    is_batch = isinstance(text, list)
+
+    # Free endpoint doesn't support batch - translate one by one
+    if is_batch and endpoint_type == "free":
+        print(f"       [INFO] Free endpoint doesn't support batch, translating {len(text)} texts individually...")
+        print(f"       [INFO] Using {request_delay}s delay between requests")
+        results = []
+        for i, single_text in enumerate(text, 1):
+            if i > 1:
+                time.sleep(request_delay)  # Use configurable delay to avoid rate limiting
+            result = translate_text_deepl(single_text, target_lang, api_url, endpoint_type, max_retries, request_delay)
+            if result is None:
+                return None
+            results.append(result)
+            if i % 10 == 0:
+                print(f"       [INFO] Progress: {i}/{len(text)} texts translated")
+        return results
+
     for attempt in range(max_retries):
         try:
             # Prepare request data based on endpoint type
             if endpoint_type == "official":
-                # Official endpoint uses array format
+                # Official endpoint supports array format for batch
                 data = {
-                    "text": [text],
+                    "text": text if is_batch else [text],
                     "target_lang": target_lang
                 }
             else:
-                # Free and Pro endpoints use the same format
-                data = {
-                    "text": text,
-                    "source_lang": "EN",
-                    "target_lang": target_lang
-                }
+                # Free and Pro endpoints
+                if is_batch:
+                    # Batch mode - use array format (for pro endpoint)
+                    data = {
+                        "text": text,
+                        "source_lang": "EN",
+                        "target_lang": target_lang
+                    }
+                else:
+                    # Single text - use string format (as per official docs)
+                    data = {
+                        "text": text,  # text is already a string here
+                        "source_lang": "EN",
+                        "target_lang": target_lang
+                    }
 
-            post_data = json.dumps(data)
-            response = httpx.post(url=api_url, data=post_data, timeout=30.0)
+            response = httpx.post(url=api_url, json=data, timeout=30.0)
 
             if response.status_code == 200:
                 result = response.json()
 
                 # Handle different response formats
-                if endpoint_type == "official":
-                    # Official endpoint returns: {"translations": [{"text": "..."}]}
-                    if 'translations' in result and len(result['translations']) > 0:
+                # All endpoints should return: {"translations": [{"text": "..."}]}
+                if 'translations' in result and len(result['translations']) > 0:
+                    if is_batch:
+                        return [t['text'] for t in result['translations']]
+                    else:
                         return result['translations'][0]['text']
-                else:
-                    # Free/Pro endpoints return: {"data": "..."} or {"translations": [...]}
-                    if 'data' in result:
+                # Fallback for older DeepLX versions that return {"data": "..."}
+                elif 'data' in result:
+                    # This format doesn't support batch translation properly
+                    if is_batch:
+                        print(f"       ⚠ Warning: API returned single 'data' field for batch request")
+                        return None
+                    else:
                         return result['data']
-                    elif 'translations' in result and len(result['translations']) > 0:
-                        return result['translations'][0]['text']
 
                 print(f"       ⚠ Unexpected response format: {result}")
                 return None
@@ -212,11 +247,20 @@ def translate_text_deepl(text, target_lang, api_url, endpoint_type="free", max_r
 
     return None
 
-def translate_entries(results, api_url, endpoint_type="free", delay=0.5, dry_run=False):
-    """Translate all untranslated entries using DeepL"""
+def translate_entries(results, api_url, endpoint_type="free", batch_size=10, delay=0.5, dry_run=False):
+    """Translate all untranslated entries using DeepL with batch support
+
+    Args:
+        results: Dictionary of po files and their untranslated entries
+        api_url: DeepL API endpoint URL
+        endpoint_type: Type of endpoint ('free', 'pro', 'official')
+        batch_size: Number of entries to translate in one request
+        delay: Delay between batch requests in seconds
+        dry_run: If True, don't actually translate
+    """
     total_translated = 0
     consecutive_failures = 0
-    max_consecutive_failures = 5
+    max_consecutive_failures = 3
 
     for po_file, data in sorted(results.items()):
         lang_name = data['lang_name']
@@ -227,6 +271,7 @@ def translate_entries(results, api_url, endpoint_type="free", delay=0.5, dry_run
         print(f"\nProcessing: {po_file}")
         print(f"Language: {lang_name} ({lang_code} -> DeepL: {deepl_code})")
         print(f"Endpoint: {endpoint_type}")
+        print(f"Batch size: {batch_size}")
         print(f"Untranslated entries: {len(untranslated)}")
 
         if dry_run:
@@ -237,12 +282,10 @@ def translate_entries(results, api_url, endpoint_type="free", delay=0.5, dry_run
         with open(po_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Translate each entry
-        for i, entry in enumerate(untranslated, 1):
-            msgid = entry['msgid']
-            if not msgid:
-                continue
+        # Process in batches
+        total_batches = (len(untranslated) + batch_size - 1) // batch_size
 
+        for batch_idx in range(total_batches):
             # Check if we should stop due to too many consecutive failures
             if consecutive_failures >= max_consecutive_failures:
                 print(f"\n⚠ Stopping translation: {consecutive_failures} consecutive failures detected.")
@@ -256,24 +299,40 @@ def translate_entries(results, api_url, endpoint_type="free", delay=0.5, dry_run
                 print(f"\nProgress saved: {total_translated} entries translated so far")
                 return total_translated
 
-            print(f"  [{i}/{len(untranslated)}] Translating: {msgid[:60]}...")
+            # Get batch of entries
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(untranslated))
+            batch_entries = untranslated[start_idx:end_idx]
 
-            translation = translate_text_deepl(msgid, deepl_code, api_url, endpoint_type)
+            # Extract msgids for batch translation
+            batch_msgids = [entry['msgid'] for entry in batch_entries if entry['msgid']]
 
-            if translation:
-                # Replace empty msgstr with translation
-                old_block = entry['block']
-                new_block = old_block.replace('msgstr ""', f'msgstr "{translation}"')
-                content = content.replace(old_block, new_block)
-                total_translated += 1
+            if not batch_msgids:
+                continue
+
+            print(f"  Batch [{batch_idx + 1}/{total_batches}] Translating {len(batch_msgids)} entries...")
+
+            # Translate batch
+            translations = translate_text_deepl(batch_msgids, deepl_code, api_url, endpoint_type, request_delay=delay)
+
+            if translations and len(translations) == len(batch_msgids):
+                # Apply translations to entries
+                for idx, entry in enumerate(batch_entries):
+                    if entry['msgid'] and idx < len(translations):
+                        translation = translations[idx]
+                        old_block = entry['block']
+                        new_block = old_block.replace('msgstr ""', f'msgstr "{translation}"')
+                        content = content.replace(old_block, new_block)
+                        total_translated += 1
+
                 consecutive_failures = 0  # Reset failure counter on success
-                print(f"       → {translation[:60]}...")
+                print(f"       ✓ Successfully translated {len(translations)} entries")
             else:
                 consecutive_failures += 1
-                print(f"       → Failed to translate (consecutive failures: {consecutive_failures})")
+                print(f"       ✗ Failed to translate batch (consecutive failures: {consecutive_failures})")
 
-            # Add delay between requests to avoid rate limiting
-            if i < len(untranslated):
+            # Add delay between batch requests
+            if batch_idx < total_batches - 1:
                 time.sleep(delay)
 
         # Write back to file
@@ -331,20 +390,26 @@ def main():
     )
     parser.add_argument(
         '--api-url',
-        default='http://localhost:1188/translate',
-        help='DeepL API URL (default: http://localhost:1188/translate for DeepLX)'
+        default='http://localhost:1188/v2/translate',
+        help='DeepL API URL (default: http://localhost:1188/v2/translate for DeepLX official endpoint)'
     )
     parser.add_argument(
         '--endpoint',
         choices=['free', 'pro', 'official'],
-        default='free',
+        default='official',
         help='DeepL endpoint type: free (/translate), pro (/v1/translate), or official (/v2/translate)'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=10,
+        help='Number of entries to translate in one batch request (default: 10)'
     )
     parser.add_argument(
         '--delay',
         type=float,
         default=0.5,
-        help='Delay between translation requests in seconds (default: 0.5)'
+        help='Delay between batch requests in seconds (default: 0.5, increase if rate limited)'
     )
     parser.add_argument(
         '--dry-run',
@@ -381,7 +446,7 @@ def main():
                 print("Translation cancelled")
                 return
 
-        total = translate_entries(results, args.api_url, args.endpoint, args.delay, args.dry_run)
+        total = translate_entries(results, args.api_url, args.endpoint, args.batch_size, args.delay, args.dry_run)
         print()
         print("=" * 80)
         print(f"Translation complete! Translated {total} entries")
