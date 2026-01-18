@@ -8,7 +8,8 @@ import re
 import sys
 import argparse
 import time
-import requests
+import json
+import httpx
 from pathlib import Path
 
 # Language code mapping for DeepL
@@ -137,30 +138,59 @@ def find_untranslated_entries(po_dir):
 
     return results
 
-def translate_text_deepl(text, target_lang, api_url, max_retries=3):
-    """Translate text using DeepL API with retry logic"""
+def translate_text_deepl(text, target_lang, api_url, endpoint_type="free", max_retries=3):
+    """Translate text using DeepL API with retry logic
+
+    Args:
+        text: Text to translate
+        target_lang: Target language code (e.g., 'ZH', 'DE')
+        api_url: API endpoint URL
+        endpoint_type: Type of endpoint - 'free', 'pro', or 'official'
+        max_retries: Maximum number of retry attempts
+    """
     for attempt in range(max_retries):
         try:
-            response = requests.post(
-                api_url,
-                json={
+            # Prepare request data based on endpoint type
+            if endpoint_type == "official":
+                # Official endpoint uses array format
+                data = {
+                    "text": [text],
+                    "target_lang": target_lang
+                }
+            else:
+                # Free and Pro endpoints use the same format
+                data = {
                     "text": text,
                     "source_lang": "EN",
                     "target_lang": target_lang
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=30
-            )
+                }
+
+            post_data = json.dumps(data)
+            response = httpx.post(url=api_url, data=post_data, timeout=30.0)
 
             if response.status_code == 200:
                 result = response.json()
-                if 'data' in result:
-                    return result['data']
-                elif 'translations' in result and len(result['translations']) > 0:
-                    return result['translations'][0]['text']
+
+                # Handle different response formats
+                if endpoint_type == "official":
+                    # Official endpoint returns: {"translations": [{"text": "..."}]}
+                    if 'translations' in result and len(result['translations']) > 0:
+                        return result['translations'][0]['text']
                 else:
-                    print(f"       ⚠ Unexpected response format: {result}")
-                    return None
+                    # Free/Pro endpoints return: {"data": "..."} or {"translations": [...]}
+                    if 'data' in result:
+                        return result['data']
+                    elif 'translations' in result and len(result['translations']) > 0:
+                        return result['translations'][0]['text']
+
+                print(f"       ⚠ Unexpected response format: {result}")
+                return None
+
+            elif response.status_code == 503:
+                # Rate limit hit - use exponential backoff
+                wait_time = (2 ** attempt) * 5  # 5s, 10s, 20s
+                print(f"       ⚠ Rate limit hit. Waiting {wait_time}s before retry... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
             else:
                 error_msg = f"HTTP {response.status_code}: {response.text}"
                 if attempt < max_retries - 1:
@@ -171,7 +201,7 @@ def translate_text_deepl(text, target_lang, api_url, max_retries=3):
                     print(f"       ✗ Translation failed after {max_retries} attempts: {error_msg}")
                     return None
 
-        except requests.exceptions.RequestException as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
                 print(f"       ⚠ Error: {e}. Retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
@@ -182,9 +212,11 @@ def translate_text_deepl(text, target_lang, api_url, max_retries=3):
 
     return None
 
-def translate_entries(results, api_url, delay=0.5, dry_run=False):
+def translate_entries(results, api_url, endpoint_type="free", delay=0.5, dry_run=False):
     """Translate all untranslated entries using DeepL"""
     total_translated = 0
+    consecutive_failures = 0
+    max_consecutive_failures = 5
 
     for po_file, data in sorted(results.items()):
         lang_name = data['lang_name']
@@ -194,6 +226,7 @@ def translate_entries(results, api_url, delay=0.5, dry_run=False):
 
         print(f"\nProcessing: {po_file}")
         print(f"Language: {lang_name} ({lang_code} -> DeepL: {deepl_code})")
+        print(f"Endpoint: {endpoint_type}")
         print(f"Untranslated entries: {len(untranslated)}")
 
         if dry_run:
@@ -210,9 +243,22 @@ def translate_entries(results, api_url, delay=0.5, dry_run=False):
             if not msgid:
                 continue
 
+            # Check if we should stop due to too many consecutive failures
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"\n⚠ Stopping translation: {consecutive_failures} consecutive failures detected.")
+                print("This usually means:")
+                print("  1. Your IP has been rate-limited by DeepL")
+                print("  2. The DeepL service is temporarily unavailable")
+                print("\nSuggestions:")
+                print("  - Wait 30-60 minutes before trying again")
+                print("  - Use a longer --delay (e.g., --delay 5.0)")
+                print("  - Consider using a different DeepL endpoint or API key")
+                print(f"\nProgress saved: {total_translated} entries translated so far")
+                return total_translated
+
             print(f"  [{i}/{len(untranslated)}] Translating: {msgid[:60]}...")
 
-            translation = translate_text_deepl(msgid, deepl_code, api_url)
+            translation = translate_text_deepl(msgid, deepl_code, api_url, endpoint_type)
 
             if translation:
                 # Replace empty msgstr with translation
@@ -220,9 +266,11 @@ def translate_entries(results, api_url, delay=0.5, dry_run=False):
                 new_block = old_block.replace('msgstr ""', f'msgstr "{translation}"')
                 content = content.replace(old_block, new_block)
                 total_translated += 1
+                consecutive_failures = 0  # Reset failure counter on success
                 print(f"       → {translation[:60]}...")
             else:
-                print(f"       → Failed to translate")
+                consecutive_failures += 1
+                print(f"       → Failed to translate (consecutive failures: {consecutive_failures})")
 
             # Add delay between requests to avoid rate limiting
             if i < len(untranslated):
@@ -287,6 +335,12 @@ def main():
         help='DeepL API URL (default: http://localhost:1188/translate for DeepLX)'
     )
     parser.add_argument(
+        '--endpoint',
+        choices=['free', 'pro', 'official'],
+        default='free',
+        help='DeepL endpoint type: free (/translate), pro (/v1/translate), or official (/v2/translate)'
+    )
+    parser.add_argument(
         '--delay',
         type=float,
         default=0.5,
@@ -327,7 +381,7 @@ def main():
                 print("Translation cancelled")
                 return
 
-        total = translate_entries(results, args.api_url, args.delay, args.dry_run)
+        total = translate_entries(results, args.api_url, args.endpoint, args.delay, args.dry_run)
         print()
         print("=" * 80)
         print(f"Translation complete! Translated {total} entries")
