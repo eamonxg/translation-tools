@@ -416,6 +416,12 @@ def main():
         action='store_true',
         help='Show what would be translated without actually doing it'
     )
+    parser.add_argument(
+        '--yes',
+        '-y',
+        action='store_true',
+        help='Skip confirmation prompt and proceed with translation'
+    )
 
     args = parser.parse_args()
 
@@ -440,7 +446,7 @@ def main():
         print_report(results)
         print()
 
-        if not args.dry_run:
+        if not args.dry_run and not args.yes:
             confirm = input("Proceed with translation? (yes/no): ")
             if confirm.lower() != 'yes':
                 print("Translation cancelled")
